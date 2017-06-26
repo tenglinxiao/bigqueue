@@ -1,6 +1,7 @@
 package com.leansoft.bigqueue.page;
 
 import java.io.IOException;
+import java.nio.channels.FileLock;
 import java.util.Set;
 
 /**
@@ -10,6 +11,17 @@ import java.util.Set;
  *
  */
 public interface IMappedPageFactory {
+	/**
+	 * Try acquire exclusive lock on page file.
+	 * @param index
+	 */
+	boolean tryLock(long index) throws IOException;
+	
+	/**
+	 * Try release exclusive lock on page file.
+	 * @param index
+	 */
+	void releaseLock(long index) throws IOException;
 	
 	/**
 	 * Acquire a mapped page with specific index from the factory

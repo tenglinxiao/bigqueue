@@ -55,6 +55,8 @@ public class BigArrayImpl implements IBigArray {
 	// size in bytes of a data page
 	final int DATA_PAGE_SIZE;
 	
+	final int MAX_ALLOWED_PAGES;
+	
 	// default size in bytes of a data page
 	public final static int DEFAULT_DATA_PAGE_SIZE = 128 * 1024 * 1024;
 	// minimum size in bytes of a data page
@@ -129,6 +131,19 @@ public class BigArrayImpl implements IBigArray {
 	 * @throws IOException exception throws during array initialization
 	 */
 	public BigArrayImpl(String arrayDir, String arrayName, int pageSize) throws IOException {
+		this(arrayDir, arrayName, pageSize, Integer.MAX_VALUE);
+	}
+	
+	/**
+	 * A big array implementation supporting sequential write and random read.
+	 * 
+	 * @param arrayDir directory for array data store
+	 * @param arrayName the name of the array, will be appended as last part of the array directory
+	 * @param pageSize the back data file size per page in bytes, see minimum allowed {@link #MINIMUM_DATA_PAGE_SIZE}.
+	 * @param maxAllowedPages max allowed data pages for this array.
+	 * @throws IOException exception throws during array initialization
+	 */
+	public BigArrayImpl(String arrayDir, String arrayName, int pageSize, int maxAllowedPages) throws IOException {
 		arrayDirectory = arrayDir;
 		if (!arrayDirectory.endsWith(File.separator)) {
 			arrayDirectory += File.separator;
@@ -146,6 +161,7 @@ public class BigArrayImpl implements IBigArray {
 		}
 		
 		DATA_PAGE_SIZE = pageSize;
+		MAX_ALLOWED_PAGES = maxAllowedPages;
 		
 		this.commonInit();
 	}
@@ -162,7 +178,7 @@ public class BigArrayImpl implements IBigArray {
 				INDEX_PAGE_CACHE_TTL);
 		this.dataPageFactory = new MappedPageFactoryImpl(DATA_PAGE_SIZE, 
 				this.arrayDirectory + DATA_PAGE_FOLDER, 
-				DATA_PAGE_CACHE_TTL);
+				DATA_PAGE_CACHE_TTL, MAX_ALLOWED_PAGES);
 		// the ttl does not matter here since meta data page is always cached
 		this.metaPageFactory = new MappedPageFactoryImpl(META_DATA_PAGE_SIZE, 
 				this.arrayDirectory + META_DATA_PAGE_FOLDER, 
@@ -174,6 +190,8 @@ public class BigArrayImpl implements IBigArray {
 		// initialize data page indexes
 		initDataPageIndex();
 	}
+	
+
 
 	@Override
 	public void removeAll() throws IOException {

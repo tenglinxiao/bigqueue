@@ -1,9 +1,10 @@
 package com.leansoft.bigqueue;
 
-import com.google.common.util.concurrent.ListenableFuture;
-
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.List;
+
+import com.google.common.util.concurrent.ListenableFuture;
 
 /**
  * Queue ADT
@@ -61,7 +62,24 @@ public interface IBigQueue extends Closeable {
 	 * @throws IOException exception throws if there is any IO error during peek operation.
 	 */
 	public byte[] peek()  throws IOException;
-
+	
+	/**
+	 * Retrieves the item at the end of a queue
+	 * 
+	 * @return data at the end of a queue
+	 * @throws IOException exception throws if there is any IO error during peek operation.
+	 */
+	public byte[] peekLast() throws IOException;
+	
+	/**
+	 * Uncommit the temporary write index.
+	 */
+	public void uncommit();
+	
+	/**
+	 * Commit the temporary write index.
+	 */
+	public void commit() throws IOException;;
 
     /**
      * Retrieves the item at the front of a queue asynchronously.

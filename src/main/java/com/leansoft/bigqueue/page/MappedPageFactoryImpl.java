@@ -1,16 +1,24 @@
 package com.leansoft.bigqueue.page;
 
+import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
+
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,8 +26,6 @@ import org.slf4j.LoggerFactory;
 import com.leansoft.bigqueue.cache.ILRUCache;
 import com.leansoft.bigqueue.cache.LRUCacheImpl;
 import com.leansoft.bigqueue.utils.FileUtil;
-
-import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
 
 /**
  * Mapped mapped page resource manager,
@@ -47,9 +53,20 @@ public class MappedPageFactoryImpl implements IMappedPageFactory {
 	public static final String PAGE_FILE_NAME = "page";
 	public static final String PAGE_FILE_SUFFIX = ".dat";
 	
+	private Map<String, FileLock> fileLocks = new HashMap<String, FileLock>();
+	
 	private ILRUCache<Long, MappedPageImpl> cache;
 	
+	// Max allowed pages size.
+	private int maxAllowedPages;
+	
+	private AtomicInteger pages = new AtomicInteger(0);
+	
 	public MappedPageFactoryImpl(int pageSize, String pageDir, long cacheTTL) {
+		this(pageSize, pageDir, cacheTTL, Integer.MAX_VALUE);
+	}
+	
+	public MappedPageFactoryImpl(int pageSize, String pageDir, long cacheTTL, int maxAllowedPages) {
 		this.pageSize = pageSize;
 		this.pageDir = pageDir;
 		this.ttl = cacheTTL;
@@ -62,8 +79,10 @@ public class MappedPageFactoryImpl implements IMappedPageFactory {
 		}
 		this.pageFile = this.pageDir + PAGE_FILE_NAME + "-"; 
 		this.cache = new LRUCacheImpl<Long, MappedPageImpl>();
+		this.maxAllowedPages = maxAllowedPages;
+		this.pages.set(this.getBackPageFileSet().size());
 	}
-
+	
 	public IMappedPage acquirePage(long index) throws IOException {
 		MappedPageImpl mpi = cache.get(index);
 		if (mpi == null) { // not in cache, need to create one
@@ -80,13 +99,25 @@ public class MappedPageFactoryImpl implements IMappedPageFactory {
 					if (mpi == null) {
 						RandomAccessFile raf = null;
 						FileChannel channel = null;
+						boolean newCreated = false;
 						try {
 							String fileName = this.getFileNameByIndex(index);
+							// Case on new page created.
+							if (Files.notExists(Paths.get(fileName))) {
+								if (this.pages.get() + 1 > maxAllowedPages) {
+									throw new IOException(String.format("Exceed max allowed pages %d.", this.maxAllowedPages));
+								}
+								newCreated = true;
+							}
 							raf = new RandomAccessFile(fileName, "rw");
 							channel = raf.getChannel();
 							MappedByteBuffer mbb = channel.map(READ_WRITE, 0, this.pageSize);
 							mpi = new MappedPageImpl(mbb, fileName, index);
 							cache.put(index, mpi, ttl);
+							
+							if (newCreated) {
+								this.pages.incrementAndGet();
+							}
 							if (logger.isDebugEnabled()) {
 								logger.debug("Mapped page for " + fileName + " was just created and cached.");
 							}
@@ -187,6 +218,7 @@ public class MappedPageFactoryImpl implements IMappedPageFactory {
 			}
 		}
 		if (deleted) {
+			this.pages.decrementAndGet();
 			logger.info("Page file " + fileName + " was just deleted.");
 		} else {
 			logger.warn("fail to delete file " + fileName + " after max " + maxRound + " rounds of try, you may delete it manually.");
@@ -328,6 +360,38 @@ public class MappedPageFactoryImpl implements IMappedPageFactory {
 			}
 		}
 		return totalSize;
+	}
+
+	@Override
+	public boolean tryLock(long index) throws IOException {
+		String fileName = this.getFileNameByIndex(index);
+		if (!fileLocks.containsKey(fileName)) {
+			synchronized(fileLocks) {
+				if (!fileLocks.containsKey(fileName)) {
+					RandomAccessFile file = new RandomAccessFile(fileName, "rw");
+					FileLock lock = file.getChannel().tryLock();
+					if (lock != null) {
+						fileLocks.put(fileName, lock);
+						if (logger.isDebugEnabled()) {
+							logger.debug("Mapped page for " + fileName + " was just locked.");
+						}
+						return true;
+					}
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+	
+	@Override
+	public void releaseLock(long index) throws IOException {
+		String fileName = this.getFileNameByIndex(index);
+		FileLock fileLock = fileLocks.get(fileName);
+		if (fileLock != null) {
+			fileLock.close();
+			fileLock.channel().close();
+		}
 	}
 
 }

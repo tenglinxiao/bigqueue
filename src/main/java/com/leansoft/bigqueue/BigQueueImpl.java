@@ -2,6 +2,8 @@ package com.leansoft.bigqueue;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -33,21 +35,37 @@ public class BigQueueImpl implements IBigQueue {
     final static int QUEUE_FRONT_INDEX_ITEM_LENGTH_BITS = 3;
     // size in bytes of queue front index page
     final static int QUEUE_FRONT_INDEX_PAGE_SIZE = 1 << QUEUE_FRONT_INDEX_ITEM_LENGTH_BITS;
+    
+    // 2 ^ 3 = 8
+ 	final static int PID_DATA_ITEM_LENGTH_BITS = 3;
+ 	// size in bytes of pid data page.
+ 	final static int PID_DATA_PAGE_SIZE = 1 << PID_DATA_ITEM_LENGTH_BITS;
+ 	
     // only use the first page
     static final long QUEUE_FRONT_PAGE_INDEX = 0;
+    // only use the first page.
+ 	static final long PID_DATA_PAGE_INDEX = 0;
 
     // folder name for queue front index page
     final static String QUEUE_FRONT_INDEX_PAGE_FOLDER = "front_index";
+    
+    // folder name for pid data page.
+ 	final static String PID_DATA_PAGE_FOLDER = "pid";
 
     // front index of the big queue,
     final AtomicLong queueFrontIndex = new AtomicLong();
+    
+    final AtomicLong queueTempFrontIndex = new AtomicLong();
 
     // factory for queue front index page management(acquire, release, cache)
     IMappedPageFactory queueFrontIndexPageFactory;
+    
+    // factory for pid page management(acquire, release, cache)
+ 	IMappedPageFactory pidPageFactory; 
 
     // locks for queue front write management
     final Lock queueFrontWriteLock = new ReentrantLock();
-
+    
     // lock for dequeueFuture access
     private final Object futureLock = new Object();
     private SettableFuture<byte[]> dequeueFuture;
@@ -74,8 +92,28 @@ public class BigQueueImpl implements IBigQueue {
      * @throws IOException exception throws if there is any IO error during queue initialization
      */
     public BigQueueImpl(String queueDir, String queueName, int pageSize) throws IOException {
-        innerArray = new BigArrayImpl(queueDir, queueName, pageSize);
+        this(queueDir, queueName, pageSize, Integer.MAX_VALUE);
+    }
+    
+    /**
+     * A big, fast and persistent queue implementation.
+     *
+     * @param queueDir  the directory to store queue data
+     * @param queueName the name of the queue, will be appended as last part of the queue directory
+     * @param pageSize  the back data file size per page in bytes, see minimum allowed {@link BigArrayImpl#MINIMUM_DATA_PAGE_SIZE}
+     * @param maxpages  max allowed pages for big queue.
+     * @throws IOException exception throws if there is any IO error during queue initialization
+     */
+    public BigQueueImpl(String queueDir, String queueName, int pageSize, int maxAllowedPages) throws IOException {
+        innerArray = new BigArrayImpl(queueDir, queueName, pageSize, maxAllowedPages);
 
+    	this.pidPageFactory = new MappedPageFactoryImpl(PID_DATA_PAGE_SIZE, 
+    			 ((BigArrayImpl) innerArray).getArrayDirectory() + PID_DATA_PAGE_FOLDER, 
+				10 * 1000/*does not matter*/);
+		if (!this.pidPageFactory.tryLock(PID_DATA_PAGE_INDEX)) {
+			throw new IOException(String.format("File array built on directory {} is locked by other process.", ((BigArrayImpl) innerArray).getArrayDirectory()));
+		}
+		
         // the ttl does not matter here since queue front index page is always cached
         this.queueFrontIndexPageFactory = new MappedPageFactoryImpl(QUEUE_FRONT_INDEX_PAGE_SIZE,
                 ((BigArrayImpl) innerArray).getArrayDirectory() + QUEUE_FRONT_INDEX_PAGE_FOLDER,
@@ -85,8 +123,9 @@ public class BigQueueImpl implements IBigQueue {
         ByteBuffer queueFrontIndexBuffer = queueFrontIndexPage.getLocal(0);
         long front = queueFrontIndexBuffer.getLong();
         queueFrontIndex.set(front);
+        queueTempFrontIndex.set(front);
     }
-
+    
     @Override
     public boolean isEmpty() {
         return this.queueFrontIndex.get() == this.innerArray.getHeadIndex();
@@ -98,17 +137,16 @@ public class BigQueueImpl implements IBigQueue {
 
         this.completeFutures();
     }
-
-
+    
     @Override
     public byte[] dequeue() throws IOException {
         long queueFrontIndex = -1L;
         try {
             queueFrontWriteLock.lock();
-            if (this.isEmpty()) {
+            if (this.queueTempFrontIndex.get() == this.innerArray.getHeadIndex()) {
                 return null;
             }
-            queueFrontIndex = this.queueFrontIndex.get();
+            queueFrontIndex = this.queueTempFrontIndex.get();
             byte[] data = this.innerArray.get(queueFrontIndex);
             long nextQueueFrontIndex = queueFrontIndex;
             if (nextQueueFrontIndex == Long.MAX_VALUE) {
@@ -116,17 +154,41 @@ public class BigQueueImpl implements IBigQueue {
             } else {
                 nextQueueFrontIndex++;
             }
-            this.queueFrontIndex.set(nextQueueFrontIndex);
+            this.queueTempFrontIndex.set(nextQueueFrontIndex);
+            
+            return data;
+        } finally {
+        	queueFrontWriteLock.unlock();
+        }
+
+    }
+    
+    @Override
+    public void uncommit() {
+    	try {
+            queueFrontWriteLock.lock();
+            queueTempFrontIndex.set(queueFrontIndex.get());
+    	} finally {
+            queueFrontWriteLock.unlock();
+    	}
+    }
+    
+    public void commit() throws IOException {
+    	try {
+            queueFrontWriteLock.lock();
+            if (queueTempFrontIndex.get() < queueFrontIndex.get()) {
+            	throw new RuntimeException(String.format("Can not commit index less than the recorded committed index: %d < %d", queueTempFrontIndex.get(), queueFrontIndex.get()));
+            }
+            queueFrontIndex.set(queueTempFrontIndex.get());
+            
             // persist the queue front
             IMappedPage queueFrontIndexPage = this.queueFrontIndexPageFactory.acquirePage(QUEUE_FRONT_PAGE_INDEX);
             ByteBuffer queueFrontIndexBuffer = queueFrontIndexPage.getLocal(0);
-            queueFrontIndexBuffer.putLong(nextQueueFrontIndex);
+            queueFrontIndexBuffer.putLong(queueFrontIndex.get());
             queueFrontIndexPage.setDirty(true);
-            return data;
-        } finally {
+    	} finally {
             queueFrontWriteLock.unlock();
-        }
-
+    	}
     }
 
     @Override
@@ -135,14 +197,13 @@ public class BigQueueImpl implements IBigQueue {
         return dequeueFuture;
     }
 
-
-
     @Override
     public void removeAll() throws IOException {
         try {
             queueFrontWriteLock.lock();
             this.innerArray.removeAll();
             this.queueFrontIndex.set(0L);
+            this.queueTempFrontIndex.set(0L);
             IMappedPage queueFrontIndexPage = this.queueFrontIndexPageFactory.acquirePage(QUEUE_FRONT_PAGE_INDEX);
             ByteBuffer queueFrontIndexBuffer = queueFrontIndexPage.getLocal(0);
             queueFrontIndexBuffer.putLong(0L);
@@ -159,6 +220,21 @@ public class BigQueueImpl implements IBigQueue {
         }
         byte[] data = this.innerArray.get(this.queueFrontIndex.get());
         return data;
+    }
+    
+    @Override
+    public byte[] peekLast() throws IOException {
+        if (this.isEmpty()) {
+            return null;
+        }
+        
+        try {
+            queueFrontWriteLock.lock();
+            byte[] data = this.innerArray.get(this.innerArray.getHeadIndex() - 1);
+            return data;
+        } finally {
+        	queueFrontWriteLock.unlock();
+        }
     }
 
     @Override
@@ -210,6 +286,7 @@ public class BigQueueImpl implements IBigQueue {
         }
 
         this.innerArray.close();
+        this.pidPageFactory.releaseLock(PID_DATA_PAGE_INDEX);
     }
 
     @Override
